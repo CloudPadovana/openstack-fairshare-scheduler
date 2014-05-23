@@ -2,6 +2,7 @@ import MySQLdb
 import datetime
 import threading
 import sys
+import json
 from nova.openstack.common import log as logging
 from nova import config
 from oslo.config import cfg
@@ -57,17 +58,23 @@ class FairShareManager(object):
             self.__getUsage(usageTable=usageTable, fromDate=str(now - datetime.timedelta(days=(x * self.periodLength))), periodLength=self.periodLength)
 
         if userId and projectId:
+            userName = None
+            projectName = None
+
             if not usageTable.has_key(projectId):
-                usageTable[projectId] = {"name": "", "users":{}}
-                if self.projectShares and self.projectShares.has_key(projectId):
-                    usageTable[projectId] = {"name": "", "share": self.projectShares[projectId], "users":{}}
+                (userName, projectName) = self.__getUserNameProjectName(userId, projectId)
+
+                if self.projectShares and self.projectShares.has_key(projectName):
+                    usageTable[projectId] = {"name":projectName, "share":float(self.projectShares[projectName]), "users":{}}
                 else:
-                    usageTable[projectId] = {"name": "", "share": self.defaultProjectShare, "users":{}}
+                    usageTable[projectId] = {"name":projectName, "share":self.defaultProjectShare, "users":{}}
 
             users = usageTable[projectId]["users"]
             if not users.has_key(userId):
-                (userName, projectName) = self.__getUserNameProjectName(userId,projectId)
-                usageTable[projectId]["name"] = projectName
+                if not userName:
+                    (userName, projectName) = self.__getUserNameProjectName(userId, projectId)
+
+                #usageTable[projectId]["name"] = projectName
                 usageRecord = { "memory":0, "normalizedMemoryUsage":float(0), "vcpus":0, "normalizedVcpusUsage":float(0), "timeUsage":0 }
                 users[userId] = {"name":userName, "usageRecords":[]}
                 users[userId]["usageRecords"].append(usageRecord)
@@ -88,23 +95,17 @@ class FairShareManager(object):
         for projectId, project in usageTable.items():
             # check the share for each user and update the usageRecord                
             users = project["users"]
+            projectName = project["name"]
             projectShare = project["share"]
-
-            """
-            if self.projectShares and self.projectShares.has_key(projectId):
-                projectShare = self.projectShares[projectId]
-            else:
-                projectShare = self.defaultProjectShare
-            """
 
             siblingShare = 0
             
             for userId, user in users.items():
+                userName = user["name"]
                 userShare = 0
                 
-                if self.userShares and self.userShares.has_key(userId):
-                    userShare = self.userShares[userId]
-                    
+                if self.userShares and self.userShares.has_key(projectName) and self.userShares[projectName].has_key(userName):
+                    userShare = self.userShares[projectName][userName]
                     if userShare > projectShare:
                         userShare = 1
                        
@@ -282,8 +283,8 @@ class FairShareManager(object):
 
                 usageRecord = { "normalizedMemoryUsage":float(row[4]), "normalizedVcpusUsage":float(row[5]) }
                 
-                if self.projectShares and self.projectShares.has_key(projectId):
-                    projectShare = self.projectShares[projectId]
+                if self.projectShares and self.projectShares.has_key(projectName):
+                    projectShare = self.projectShares[projectName]
                 else:
                     projectShare = self.defaultProjectShare
 
@@ -293,6 +294,7 @@ class FairShareManager(object):
                 users = usageTable[projectId]["users"]
                 if not users.has_key(userId):
                     users[userId] = {"name":userName, "usageRecords":[]}
+
 
                 LOG.info("project=%s %s" % (projectId, usageTable[projectId]))
      
@@ -415,12 +417,12 @@ if __name__ == '__main__':
                default = 10,
                help = 'the default share'),
 
-        cfg.ListOpt('project_shares',
-               default = ["dd4cfc949fd14941aa1dfa2c16bc741b:50"],
+        cfg.StrOpt('project_shares',
+               default = None,
                help = 'the list of project shares'),
                          
-        cfg.ListOpt('user_shares',
-               default = ["2132f3da5a3a44f0b62a12debdec50f2:3"],
+        cfg.StrOpt('user_shares',
+               default = None,
                help = 'the list of user shares')
     ]
 
@@ -429,19 +431,24 @@ if __name__ == '__main__':
     #cfg.CONF.import_opt('fair_share_vcpus_weight', 'nova.scheduler.fairshare_scheduler')
     cfg.CONF(['--config-file', "/etc/nova/nova.conf"])
     
-    #projectShares = { "017e0f41868c4681ac8749acc8c9f1ee":50, "2a1e8f0a98c84186b67e9bcb8b0def6e":40, "9765cf166389417ba5e85f33c718884d":10, "cb49095ce6e24c5cbe00d2687d808b8d":0 }
-
-    #userShares = { "2132f3da5a3a44f0b62a12debdec50f2":1 }
-   
     projectShares = {}
-    for share in cfg.CONF.project_shares:
-        x = share.split(":")
-        projectShares[x[0]] = float(x[1])
+    projectSharesCfg = cfg.CONF.project_shares
+
+    if projectSharesCfg:
+        projectSharesCfg = projectSharesCfg.replace("'", "\"")
+        projectShares = json.loads(projectSharesCfg)
+
+        #userShares = dict([(str(k), v) for k, v in userShares.items()])
 
     userShares = {}
-    for share in cfg.CONF.user_shares:
-        x = share.split(":")
-        userShares[x[0]] = float(x[1])
+    userShareCfg = cfg.CONF.user_shares
+
+    if userShareCfg:
+        userShareCfg = userShareCfg.replace("'", "\"")
+        userShares = json.loads(userShareCfg)
+        #userShares = dict([(str(k), v) for k, v in userShares.items()])
+
+
     """
     print("mysqlHost=%s") % cfg.CONF.mysql_host
     print("mysqlUser=%s") % cfg.CONF.mysql_user

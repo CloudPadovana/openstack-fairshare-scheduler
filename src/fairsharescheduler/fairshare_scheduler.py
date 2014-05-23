@@ -6,6 +6,7 @@ import threading
 import MySQLdb
 import time
 import signal
+import json
 
 from nova import exception, notifier
 from nova.compute import rpcapi as compute_rpcapi
@@ -94,13 +95,13 @@ filter_scheduler_opts = [
     cfg.IntOpt('default_project_share',
                default = 10,
                help = 'the default share'),
-          
-    cfg.ListOpt('project_shares',
-               default = ["017e0f41868c4681ac8749acc8c9f1ee:50", "2a1e8f0a98c84186b67e9bcb8b0def6e:40", "9765cf166389417ba5e85f33c718884d:10", "cb49095ce6e24c5cbe00d2687d808b8d:0"],
+
+    cfg.StrOpt('project_shares',
+               default = None,
                help = 'the list of project shares'),
-                         
-    cfg.ListOpt('user_shares',
-               default = ["2132f3da5a3a44f0b62a12debdec50f2:3"],
+
+    cfg.StrOpt('user_shares',
+               default = None,
                help = 'the list of user shares')
 ]                         
 
@@ -210,7 +211,23 @@ class FairShareScheduler(driver.Scheduler):
 
         if CONF.scheduler_max_attempts < 1:
             raise exception.NovaException(_("Invalid value for 'scheduler_max_attempts', must be >= 1"))
-        
+       
+        projectShares = {}
+        projectSharesCfg = cfg.CONF.project_shares
+
+        if projectSharesCfg:
+            projectSharesCfg = projectSharesCfg.replace("'", "\"")
+            projectShares = json.loads(projectSharesCfg)
+
+        userShares = {}
+        userShareCfg = cfg.CONF.user_shares
+
+        if userShareCfg:
+            userShareCfg = userShareCfg.replace("'", "\"")
+            userShares = json.loads(userShareCfg)
+            #userShares = dict([(str(k), v) for k, v in userShares.items()])
+
+        """ 
         projectShares = {}
         for share in CONF.project_shares:
             x = share.split(":")
@@ -220,6 +237,7 @@ class FairShareScheduler(driver.Scheduler):
         for share in CONF.user_shares:
             x = share.split(":")
             userShares[x[0]] = float(x[1])
+        """
 
         self.vcpuRatio = CONF.cpu_allocation_ratio
         self.computeResources = {}
