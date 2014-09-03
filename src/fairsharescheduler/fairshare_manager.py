@@ -1,18 +1,3 @@
-# Copyright (c) 2014 INFN - "Istituto Nazionale di Fisica Nucleare" - Italy
-# All Rights Reserved.
-#
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
-#    not use this file except in compliance with the License. You may obtain
-#    a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-#    Unless required by applicable law or agreed to in writing, software
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-#    License for the specific language governing permissions and limitations
-#    under the License. 
-
 import MySQLdb
 import datetime
 import threading
@@ -29,7 +14,7 @@ LOG = logging.getLogger(__name__)
 
 class FairShareManager(object):
 
-    def __init__(self, mysqlHost, mysqlUser, mysqlPasswd, numOfPeriods=3, periodLength=5, projectShares=None, defaultProjectShare=10.0, userShares=None, decayWeight=0.5):
+    def __init__(self, mysqlHost, mysqlUser, mysqlPasswd, numOfPeriods=3, periodLength=5, projectShares=None, defaultProjectShare=10.0, userShares=None, decayWeight=0.5, vcpusWeight=10000, memoryWeight=7000):
         if not mysqlHost:
             raise Exception("mysqlHost not defined!")
         
@@ -57,7 +42,8 @@ class FairShareManager(object):
         self.defaultProjectShare = defaultProjectShare
         #self.projectShares["totalShare"] = 0
         self.decayWeight = decayWeight
-        
+        self.vcpusWeight = vcpusWeight
+        self.memoryWeight = memoryWeight
         """
         for share in self.projectShares.values():
             self.projectShares["totalShare"] += share
@@ -248,24 +234,26 @@ class FairShareManager(object):
         msg += '{0:10s}| {1:8s}| {2:11s}| {3:14s}| {4:19s}| {5:20s}| {6:19s}| {7:19s}| {8:9s}| {9:10s}\n'.format("USER", "PROJECT", "USER SHARE", "PROJECT SHARE", "FAIR-SHARE (Vcpus)", "FAIR-SHARE (Memory)", "actual vcpus usage", "effec. vcpus usage", "priority", "VMs")
         msg += "-------------------------------------------------------------------------------------------------------------------------------------------------------\n"
 
-        for project in self.usageTable.values():
+
+        conn = MySQLdb.connect(self.mysqlHost, self.mysqlUser, self.mysqlPasswd)
+
+        for projectId, project in self.usageTable.items():
             vmInstances = 0
             for userId, user in project["users"].items():
-                
-                conn = MySQLdb.connect(self.mysqlHost, self.mysqlUser, self.mysqlPasswd)
+                #conn = MySQLdb.connect(self.mysqlHost, self.mysqlUser, self.mysqlPasswd)
                 cursor = conn.cursor()
                 try:
-                    cursor.execute("select count(*) from nova.instances where vm_state='active' and user_id='"+userId+"'")
-                    
+                    #cursor.execute("select count(*) from nova.instances where vm_state='active' and user_id='"+userId+"'")
+                    cursor.execute("select count(*) from nova.instances where terminated_at is null and launched_at is not null and deleted_at is null and user_id='"+userId+"' and project_id='"+projectId+"'")
                     row = cursor.fetchone()
                     vmInstances = row[0]
                 except Exception as inst:
                     LOG.error("error=%s" % inst)
                 finally:
                     cursor.close()
-                    conn.close()
+                    #conn.close()
                     
-                msg += "{0:10s}| {1:8s}| {2:11s}| {3:14s}| {4:19s}| {5:20s}| {6:19s}| {7:19s}| {8:9}| {9:10}\n".format(user["name"], project["name"], str(user["share"]) + "%", str(project["share"]) + "%", str(user["fairShareVcpus"]), str(user["fairShareMemory"]), "{0:.1f}%".format(user["normalizedVcpusUsage"]*100), "{0:.1f}%".format(user["effectiveVcpusUsage"]*100), str(int(user["fairShareVcpus"]*10000 + user["fairShareMemory"]*7000)), str(vmInstances))
+                msg += "{0:10s}| {1:8s}| {2:11s}| {3:14s}| {4:19s}| {5:20s}| {6:19s}| {7:19s}| {8:9}| {9:10}\n".format(user["name"], project["name"], str(user["share"]) + "%", str(project["share"]) + "%", str(user["fairShareVcpus"]), str(user["fairShareMemory"]), "{0:.1f}%".format(user["normalizedVcpusUsage"]*100), "{0:.1f}%".format(user["effectiveVcpusUsage"]*100), str(int(user["fairShareVcpus"]*self.vcpusWeight + user["fairShareMemory"]*self.memoryWeight)), str(vmInstances))
         
         msg += "-------------------------------------------------------------------------------------------------------------------------------------------------------\n\n"
 
@@ -274,6 +262,8 @@ class FairShareManager(object):
         else:
             LOG.info(msg)
         
+        conn.close()
+
         
     def __getUsage(self, usageTable, fromDate, periodLength):
         LOG.info("getUsage: fromDate=%s periodLength=%s days" % (fromDate, periodLength))
@@ -297,7 +287,8 @@ class FairShareManager(object):
                 projectShare = 0.0
 
                 usageRecord = { "normalizedMemoryUsage":float(row[4]), "normalizedVcpusUsage":float(row[5]) }
-                
+                LOG.info("usageRecord=%s" % (usageRecord))
+
                 if self.projectShares and self.projectShares.has_key(projectName):
                     projectShare = self.projectShares[projectName]
                 else:
@@ -311,7 +302,7 @@ class FairShareManager(object):
                     users[userId] = {"name":userName, "usageRecords":[]}
 
 
-                LOG.info("project=%s %s" % (projectId, usageTable[projectId]))
+                #LOG.info("project=%s %s" % (projectId, usageTable[projectId]))
      
                 #LOG.info("user=%s usageRecord=%s" % (userName, usageRecord))
                 #print ("user=%s usageRecord=%s" % (userName, usageRecord))
@@ -476,8 +467,8 @@ if __name__ == '__main__':
     """
                 
     #fsm = FairShareManager(mysqlHost="193.206.210.223", mysqlUser="root", mysqlPasswd="admin", numOfPeriods=3, periodLength=5, projectShares=projectShares, userShares=userShares)
-    fsm = FairShareManager(mysqlHost=cfg.CONF.mysql_host, mysqlUser=cfg.CONF.mysql_user, mysqlPasswd=cfg.CONF.mysql_passwd, numOfPeriods=cfg.CONF.num_of_periods, periodLength=cfg.CONF.period_length, projectShares=projectShares, userShares=userShares, defaultProjectShare=cfg.CONF.default_project_share)
+    fsm = FairShareManager(mysqlHost=cfg.CONF.mysql_host, mysqlUser=cfg.CONF.mysql_user, mysqlPasswd=cfg.CONF.mysql_passwd, numOfPeriods=cfg.CONF.num_of_periods, periodLength=cfg.CONF.period_length, projectShares=projectShares, userShares=userShares, defaultProjectShare=cfg.CONF.default_project_share, decayWeight=cfg.CONF.decay_weight, vcpusWeight=cfg.CONF.fair_share_vcpus_weight, memoryWeight=cfg.CONF.fair_share_memory_weight)
     fsm.calculateFairShares()
     fsm.printTable(stdout=True)
     fsm.destroy()
-    
+ 
