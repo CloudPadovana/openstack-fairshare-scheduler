@@ -1,5 +1,6 @@
 import datetime
 from oslo.config import cfg
+from oslo import messaging
 import random
 from threading import Timer
 import threading
@@ -8,12 +9,15 @@ import time
 import signal
 import json
 
-from nova import exception, notifier
+from nova import rpc
+from nova import exception
+from nova.openstack.common import importutils
 from nova.compute import rpcapi as compute_rpcapi
-from nova.openstack.common import rpc
+#from nova.openstack.common import rpc as rpc_ampq
 from nova.openstack.common import log as logging
 from nova.openstack.common.gettextutils import _
-from nova.openstack.common.rpc import amqp
+#from nova.openstack.common.rpc import amqp
+from oslo.messaging._drivers import amqp
 from nova.pci import pci_request
 from nova.scheduler import driver, scheduler_options, utils as scheduler_utils
 
@@ -107,7 +111,6 @@ filter_scheduler_opts = [
 
 CONF.register_opts(filter_scheduler_opts)
 
-
 class WorkerConsumer(threading.Thread):
     def __init__(self, threadID, name, queue, method, noComputeResourceCondition, resources):
         threading.Thread.__init__(self)
@@ -115,7 +118,7 @@ class WorkerConsumer(threading.Thread):
         self.threadID = threadID
         self.name = name
         self.method = method
-        self.noComputeResourceCondition= noComputeResourceCondition
+        self.noComputeResourceCondition = noComputeResourceCondition
         self.resources = resources
         self.queue = queue
         if not queue:
@@ -128,16 +131,16 @@ class WorkerConsumer(threading.Thread):
             try:
                 requestOK = False
                 vcpusRequired = 0
-                
+
                 LOG.info("%s (before queue.getRequest) vcpus_available %s" % (self.name, self.resources['vcpus_available']))
                 request = self.queue.getRequest()
                 LOG.info("%s dopo getRequest" % self.name)
-                
+
                 if request is not None:
                     while not requestOK:
                         with self.noComputeResourceCondition:
                             LOG.info("%s (inside noComputeResourceCondition)  vcpus_available %s" % (self.name, self.resources['vcpus_available']))
-                            
+
                             if self.resources['vcpus_available'] <= 0:
                                 LOG.info("%s waiting..." % self.name)
                                 self.noComputeResourceCondition.wait();
@@ -145,14 +148,14 @@ class WorkerConsumer(threading.Thread):
                                 request_spec = request["request_spec"]
                                 vcpusRequired = request_spec["num_instances"] * request_spec["instance_type"]["vcpus"]
                                 context = amqp.unpack_context(CONF, request["message_context"])
-                                
+
                                 LOG.info("%s vcpus_available %s" % (self.name, self.resources['vcpus_available']))
                                 self.resources['vcpus_available'] -= vcpusRequired
-                                
+
                                 LOG.info("%s vcpus_available updated %s" % (self.name, self.resources['vcpus_available']))
                                 requestOK = True
                                 self.noComputeResourceCondition.notifyAll()
-                                
+
                     LOG.info("%s user_id=%s project_id=%s timestamp=%s priority=%s (%s vcpus available)" % (self.name, request["userId"], request["projectId"], request["timestamp"], request["priority"], self.resources['vcpus_available']))
 
                     if (self.method(context=context, request=request)):
@@ -163,19 +166,19 @@ class WorkerConsumer(threading.Thread):
                     exitRun = True
             except exception.InstanceNotFound as ex:
                 LOG.info("WorkerConsumer InstanceNotFound error: type=%s ex=%s" % (type(ex), ex))
-                
+
                 self.queue.deleteRequestDB(request["idRecord"])
                 self.queue.task_done()
-                
+
                 with self.noComputeResourceCondition:
                     self.resources['vcpus_available'] += vcpusRequired
                     self.noComputeResourceCondition.notifyAll()
 
             except Exception as ex:
                 LOG.info("WorkerConsumer error: type=%s ex=%s" % (type(ex), ex))
-                
+
         LOG.info("Exiting %s" % self.name)
-                       
+
 
 class ThreadWorkerGroup(object):
     def __init__(self, queue, method, noResourceCondition, resources, thread_pool_number):
@@ -187,7 +190,7 @@ class ThreadWorkerGroup(object):
             workerConsumer = WorkerConsumer(workerId, "WorkerConsumer-" + str(workerId), queue, method, noResourceCondition, resources)
             self.threadPool.append(workerConsumer)
             LOG.info("%s created" % workerConsumer.name)
-      
+
 
     def startPool(self):
         for t in self.threadPool:
@@ -200,6 +203,55 @@ class ThreadWorkerGroup(object):
 
 
 
+
+class NotificationEndpoint(object):
+    def __init__(self, noComputeResourceCondition, computeResources):
+        self.noComputeResourceCondition = noComputeResourceCondition
+        self.computeResources = computeResources
+
+    def info(self, ctxt, publisher_id, event_type, payload, metadata):
+        #LOG.info("NotificationEndpoint INFO: event_type=%s payload=%s metadata=%s" % (event_type, payload, metadata))
+        
+        if payload is None or not payload.has_key("state"):
+           return
+
+        state = payload["state"]
+        instanceId = payload["instance_id"]
+
+        LOG.info("NotificationEndpoint INFO: event_type=%s state=%s instanceId=%s" % (event_type, state, instanceId))
+
+        if (event_type == "compute.instance.delete.end" and state == "deleted") or (event_type == "compute.instance.create.error" and state == "building") or (event_type == "scheduler.run_instance" and state == "error"):
+            memory_mb = 0
+            vcpus = 0
+
+            if event_type == "scheduler.run_instance":
+                memory_mb = payload["request_spec"]["instance_type"]["memory_mb"]
+                vcpus = payload["request_spec"]["instance_type"]["vcpus"]
+            else:
+                memory_mb = payload["memory_mb"]
+                vcpus = payload["vcpus"]
+
+            with self.noComputeResourceCondition:
+                self.computeResources["vcpus_available"] += vcpus
+                self.noComputeResourceCondition.notifyAll()
+
+            LOG.info("notify catched: event_type=%s memory_mb=%s vcpus=%s vcpus_available=%s" %(event_type, memory_mb, vcpus, self.computeResources["vcpus_available"])) #example event_type=compute.instance.delete.end memory_mb=512 vcpus=1
+
+
+    def warn(self, ctxt, publisher_id, event_type, payload, metadata):
+        LOG.info("NotificationEndpoint WARN: event_type=%s payload=%s metadata=%s" % (event_type, payload, metadata))
+        state = payload["state"]
+        instanceId = payload["instance_id"]
+        LOG.info("NotificationEndpoint WARN: event_type=%s state=%s instanceId=%s" % (event_type, state, instanceId))
+
+
+    def error(self, ctxt, publisher_id, event_type, payload, metadata):
+        LOG.info("NotificationEndpoint ERROR: %s" % (payload))
+
+
+
+
+
 class FairShareScheduler(driver.Scheduler):
     """Fair-share scheduler that can be used for filtering and weighing."""
 
@@ -207,11 +259,12 @@ class FairShareScheduler(driver.Scheduler):
         super(FairShareScheduler, self).__init__(*args, **kwargs)
         self.options = scheduler_options.SchedulerOptions()
         self.compute_rpcapi = compute_rpcapi.ComputeAPI()
-        self.notifier = notifier.get_notifier('scheduler')
+        #self.notifier = notifier.get_notifier('scheduler')
+        self.notifier = rpc.get_notifier('scheduler')
 
         if CONF.scheduler_max_attempts < 1:
             raise exception.NovaException(_("Invalid value for 'scheduler_max_attempts', must be >= 1"))
-       
+
         projectShares = {}
         projectSharesCfg = cfg.CONF.project_shares
 
@@ -242,8 +295,7 @@ class FairShareScheduler(driver.Scheduler):
         self.vcpuRatio = CONF.cpu_allocation_ratio
         self.computeResources = {}
         self.noComputeResourceCondition = threading.Condition()
-        
-
+     
         self.queue = PersistentPriorityRequestQueue(mysqlHost=CONF.mysql_host, mysqlUser=CONF.mysql_user, mysqlPasswd=CONF.mysql_passwd, mysqlDatabase=CONF.mysql_scheduler_db, poolSize=CONF.mysql_pool_size)
 
         self.faireShareManager = FairShareManager(mysqlHost=CONF.mysql_host, mysqlUser=CONF.mysql_user, mysqlPasswd=CONF.mysql_passwd, numOfPeriods=CONF.num_of_periods, periodLength=CONF.period_length, defaultProjectShare=CONF.default_project_share, projectShares=projectShares, userShares=userShares, decayWeight=CONF.decay_weight, vcpusWeight=CONF.fair_share_vcpus_weight, memoryWeight=CONF.fair_share_memory_weight)
@@ -258,17 +310,26 @@ class FairShareScheduler(driver.Scheduler):
             
         self.threadPool = ThreadWorkerGroup(self.queue, self.schedule_instance, self.noComputeResourceCondition, self.computeResources, thread_pool_size)
         self.threadPool.startPool()
-         
-        self.conn = rpc.create_connection(new=True)
-        # Share this same connection for these Consumers
-        self.conn.join_consumer_pool(topic="notifications.info", callback=self.notify, pool_name="notifications.info", exchange_name=None)
-        self.conn.join_consumer_pool(topic="notifications.error", callback=self.notify, pool_name="notifications.info", exchange_name=None)
-        # Consume from all consumers in a thread
-        self.conn.consume_in_thread()
-        
+
+        transport = messaging.get_transport(cfg.CONF)
+
+        targets = [
+            #messaging.Target(topic='notifications.info'),
+            messaging.Target(topic='notifications'),
+        ]
+
+        endpoints = [
+            NotificationEndpoint(self.noComputeResourceCondition, self.computeResources),
+            #ErrorEndpoint(),
+        ]
+
+        server = messaging.get_notification_listener(transport, targets, endpoints, executor="eventlet")
+        server.start()
+        #server.wait()
+
         signal.signal(signal.SIGALRM, self.destroy)
 
-
+    """
     def notify(self, message_data, **kwargs):
         #LOG.info(">>>>>>>>>>>>> notify!!!! message_data=%s args=%s" %(message_data, kwargs))
         event_type = message_data["event_type"]
@@ -291,8 +352,8 @@ class FairShareScheduler(driver.Scheduler):
                 self.computeResources["vcpus_available"] += vcpus
                 self.noComputeResourceCondition.notifyAll()
                
-            LOG.info("notify catched: event_type=%s memory_mb=%s vcpus=%s vcpus_available=%s" %(event_type, memory_mb, vcpus, self.computeResources["vcpus_available"])) #example event_type=compute.instance.delete.end memory_mb=512 vcpus=1
-
+            LOG.info("notify catched: event_type=%s memory_mb=%s vcpus=%s vcpus_available=%s" %(event_type, memory_mb, vcpus, computeResources["vcpus_available"])) #example event_type=compute.instance.delete.end memory_mb=512 vcpus=1
+    """
 
     def __getComputeResourceAvailable(self, mysqlHost, mysqlUser, mysqlPasswd, vcpuRatio):
         resources = {}
@@ -410,6 +471,7 @@ class FairShareScheduler(driver.Scheduler):
         """ First create a build plan (a list of WeightedHosts) and then provision.
         Returns a list of the instances created.
         """
+
         request_spec = request["request_spec"]
         filter_properties = request["filter_properties"]
         instance_uuids = request_spec["instance_uuids"]
