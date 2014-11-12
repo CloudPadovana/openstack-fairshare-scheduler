@@ -71,7 +71,7 @@ class PersistentPriorityRequestQueue(PriorityQueue):
         with self.condition:
             LOG.info("getRequest condition acquired")
             requestPQ = None
-            while ((requestPQ == None) & (not self.isDestroying)):
+            while ((requestPQ == None) and (not self.isDestroying)):
                 if PriorityQueue.qsize(self) > 0:
                     _, requestPQ = PriorityQueue.get(self)
                 else:
