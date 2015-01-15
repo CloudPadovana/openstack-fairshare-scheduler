@@ -21,6 +21,8 @@ import json
 from nova.openstack.common import log as logging
 from nova import config
 from oslo.config import cfg
+from keystoneclient.v2_0 import client
+
 
 __author__ = "Eric Frizziero, Lisa Zangrando"
 __email__ = "eric.frizziero[AT]pd.infn.it, lisa.zangrando[AT]pd.infn.it"
@@ -29,7 +31,7 @@ LOG = logging.getLogger(__name__)
 
 class FairShareManager(object):
 
-    def __init__(self, mysqlHost, mysqlUser, mysqlPasswd, numOfPeriods=3, periodLength=5, projectShares=None, defaultProjectShare=10.0, userShares=None, decayWeight=0.5, vcpusWeight=10000, memoryWeight=7000):
+    def __init__(self, mysqlHost, mysqlUser, mysqlPasswd, numOfPeriods=3, periodLength=5, projectShares=None, defaultProjectShare=10.0, userShares=None, decayWeight=0.5, vcpusWeight=10000, memoryWeight=7000, keystone_admin_user=None, keystone_admin_password=None, keystone_admin_project_name=None, keystone_auth_url=None):
         if not mysqlHost:
             raise Exception("mysqlHost not defined!")
         
@@ -59,12 +61,45 @@ class FairShareManager(object):
         self.decayWeight = decayWeight
         self.vcpusWeight = vcpusWeight
         self.memoryWeight = memoryWeight
-        """
-        for share in self.projectShares.values():
-            self.projectShares["totalShare"] += share
-        """
+        self.users = {}
+        self.projects = {}
+        self.keystone_admin_user = keystone_admin_user
+        self.keystone_admin_password = keystone_admin_password
+        self.keystone_admin_project_name = keystone_admin_project_name
+        self.keystone_auth_url = keystone_auth_url
+
+        try:
+            self.keystone = client.Client(username = self.keystone_admin_user,
+                                          password = self.keystone_admin_password,
+                                          tenant_name = self.keystone_admin_project_name,
+                                          auth_url = self.keystone_auth_url)
+            self.getUsers()
+        except Exception as ex:
+            LOG.error("ERROR: %s" % (ex))
+            raise
+
+
+
+    def getUsers(self):
+        try:      
+            userList = self.keystone.users.list()
+
+            for user in userList:
+                self.users[user.id] = user.name
+
+      
+            projectList = self.keystone.tenants.list()
+
+            for project in projectList:
+                self.projects[project.id] = project.name
+        except Exception as ex:
+            LOG.error("ERROR: %s" % (ex))
+            raise
+
 
     def calculateFairShares(self, userId=None, projectId=None):
+        self.getUsers()
+
         now = datetime.datetime.now()
         usageTable = {}
         
@@ -74,12 +109,10 @@ class FairShareManager(object):
             self.__getUsage(usageTable=usageTable, fromDate=str(now - datetime.timedelta(days=(x * self.periodLength))), periodLength=self.periodLength)
 
         if userId and projectId:
-            userName = None
-            projectName = None
+            userName = self.users[userId]
+            projectName = self.projects[projectId]
 
             if not usageTable.has_key(projectId):
-                (userName, projectName) = self.__getUserNameProjectName(userId, projectId)
-
                 if self.projectShares and self.projectShares.has_key(projectName):
                     usageTable[projectId] = {"name":projectName, "share":float(self.projectShares[projectName]), "users":{}}
                 else:
@@ -87,10 +120,6 @@ class FairShareManager(object):
 
             users = usageTable[projectId]["users"]
             if not users.has_key(userId):
-                if not userName:
-                    (userName, projectName) = self.__getUserNameProjectName(userId, projectId)
-
-                #usageTable[projectId]["name"] = projectName
                 usageRecord = { "memory":0, "normalizedMemoryUsage":float(0), "vcpus":0, "normalizedVcpusUsage":float(0), "timeUsage":0 }
                 users[userId] = {"name":userName, "usageRecords":[]}
                 users[userId]["usageRecords"].append(usageRecord)
@@ -236,7 +265,7 @@ class FairShareManager(object):
         
         self.lock.acquire()
         try:
-            self.usageTable.clear()
+            #self.usageTable.clear()
             self.usageTable.update(usageTable)
         finally:
             self.lock.release()
@@ -270,7 +299,7 @@ class FairShareManager(object):
                     
                 msg += "{0:10s}| {1:8s}| {2:11s}| {3:14s}| {4:19s}| {5:20s}| {6:19s}| {7:19s}| {8:9}| {9:10}\n".format(user["name"], project["name"], str(user["share"]) + "%", str(project["share"]) + "%", str(user["fairShareVcpus"]), str(user["fairShareMemory"]), "{0:.1f}%".format(user["normalizedVcpusUsage"]*100), "{0:.1f}%".format(user["effectiveVcpusUsage"]*100), str(int(user["fairShareVcpus"]*self.vcpusWeight + user["fairShareMemory"]*self.memoryWeight)), str(vmInstances))
         
-        msg += "-------------------------------------------------------------------------------------------------------------------------------------------------------\n\n"
+        msg += "-------------------------------------------------------------------------------------------------------------------------------------------------------\n"
 
         if stdout:
             print(msg)
@@ -287,22 +316,39 @@ class FairShareManager(object):
         conn = MySQLdb.connect(self.mysqlHost, self.mysqlUser, self.mysqlPasswd)
         cursor = conn.cursor()
         period = str(periodLength)
-        try:
-            cursor.execute("select ku.id as user, ku.name as username, kp.id as project, kp.name as projectname, ((sum((UNIX_TIMESTAMP(IF(IFNULL(ni.terminated_at,'" + fromDate + "')>='" + fromDate + "','" + fromDate + "',  ni.terminated_at)) - (IF( (ni.launched_at>=DATE_SUB('" + fromDate + "', INTERVAL '" + period + "' day)),UNIX_TIMESTAMP(ni.launched_at),UNIX_TIMESTAMP(DATE_SUB('" + fromDate + "', INTERVAL '" + period + "' day)) ))))/60) *ni.memory_mb) as memory_usage,((sum((UNIX_TIMESTAMP(IF(IFNULL(ni.terminated_at,'" + fromDate + "')>='" + fromDate + "','" + fromDate + "',  ni.terminated_at)) - (IF( (ni.launched_at>=DATE_SUB('" + fromDate + "', INTERVAL '" + period + "' day)),UNIX_TIMESTAMP(ni.launched_at),UNIX_TIMESTAMP(DATE_SUB('" + fromDate + "', INTERVAL '" + period + "' day)) ))))/60) * ni.vcpus) as vcpu_usage from nova.instances ni, keystone.user ku, keystone.project kp  where ni.user_id=ku.id and kp.id=ni.project_id and ni.launched_at IS NOT NULL and ni.launched_at <='" + fromDate + "' and(ni.terminated_at>=DATE_SUB('" + fromDate + "', INTERVAL '" + period + "' day) OR ni.terminated_at is null) group by ku.name, kp.name")
+
+        LOG.warn("mysqlUser: %s" % self.mysqlUser)
+        LOG.warn("mysqlPasswd: %s" % self.mysqlPasswd)
+        LOG.warn("mysqlHost: %s" % self.mysqlHost)
+
+
+        try:            
+            cursor.execute("select ni.user_id as user_id, ni.project_id as project, ((sum((UNIX_TIMESTAMP(IF(IFNULL(ni.terminated_at,'" + fromDate + "')>='" + fromDate + "','" + fromDate + "',  ni.terminated_at)) - (IF( (ni.launched_at>=DATE_SUB('" + fromDate + "', INTERVAL '" + period + "' day)),UNIX_TIMESTAMP(ni.launched_at),UNIX_TIMESTAMP(DATE_SUB('" + fromDate + "', INTERVAL '" + period + "' day)) ))))/60) *ni.memory_mb) as memory_usage,((sum((UNIX_TIMESTAMP(IF(IFNULL(ni.terminated_at,'" + fromDate + "')>='" + fromDate + "','" + fromDate + "',  ni.terminated_at)) - (IF( (ni.launched_at>=DATE_SUB('" + fromDate + "', INTERVAL '" + period + "' day)),UNIX_TIMESTAMP(ni.launched_at),UNIX_TIMESTAMP(DATE_SUB('" + fromDate + "', INTERVAL '" + period + "' day)) ))))/60) * ni.vcpus) as vcpu_usage from nova.instances ni where ni.launched_at IS NOT NULL and ni.launched_at <='" + fromDate + "' and(ni.terminated_at>=DATE_SUB('" + fromDate + "', INTERVAL '" + period + "' day) OR ni.terminated_at is null) group by ni.user_id, ni.project_id")
+
             projectId = 0
             userId = 0
 
-            #LOG.info("rows=%s" % str(cursor.rowcount))
+            #LOG.info(">>>>>>>>> rows=%s" % str(cursor.rowcount))
             for row in cursor.fetchall():
-                #LOG.info("row=%s" % row)
                 userId = row[0]
-                userName = row[1]
-                projectId = row[2]
-                projectName = row[3]
+                projectId = row[1]
                 projectShare = 0.0
 
-                usageRecord = { "normalizedMemoryUsage":float(row[4]), "normalizedVcpusUsage":float(row[5]) }
-                LOG.info("usageRecord=%s" % (usageRecord))
+                if self.projects.has_key(projectId):
+                    projectName = self.projects[projectId]
+                else:
+                    LOG.warn("project not found: %s" % projectId)
+                    continue
+            
+
+                if self.users.has_key(userId):
+                    userName = self.users[userId]
+                else:
+                    LOG.warn("user not found: %s" % userId)
+                    continue
+
+                usageRecord = { "normalizedMemoryUsage":float(row[2]), "normalizedVcpusUsage":float(row[3]) }
+                #LOG.info("usageRecord=%s" % (usageRecord))
 
                 if self.projectShares and self.projectShares.has_key(projectName):
                     projectShare = self.projectShares[projectName]
@@ -332,23 +378,6 @@ class FairShareManager(object):
             cursor.close()
             conn.close()
 
-    def __getUserNameProjectName(self, userId, projectId):
-        conn = MySQLdb.connect(self.mysqlHost, self.mysqlUser, self.mysqlPasswd)
-        userNameProjectName = None
-        cursor = conn.cursor()
-        try:
-            cursor.execute("select ku.name as username, kp.name as projectname from keystone.user ku, keystone.project kp  where ku.id='" + userId + "' and kp.id='" + projectId + "'")
-            item = cursor.fetchone()
-            userNameProjectName = (item[0], item[1]) 
-        except MySQLdb.Error, e:
-            LOG.info("Error %d: %s" % (e.args[0],e.args[1]))
-        finally:
-            try:
-                cursor.close()
-                conn.close()
-            except MySQLdb.Error, e:
-                pass  
-        return userNameProjectName
 
     def getFairShare(self, userId, projectId):
         if not userId:

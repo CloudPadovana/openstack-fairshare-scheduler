@@ -123,8 +123,16 @@ filter_scheduler_opts = [
                default = None,
                help = 'the list of user shares')
 ]                         
+                
+keystone_opts = [
+    cfg.StrOpt('admin_user', required=True),
+    cfg.StrOpt('admin_password', required=True),
+    cfg.StrOpt('admin_tenant_name', required=True),
+    cfg.StrOpt('auth_uri', required=True)
+]
 
 CONF.register_opts(filter_scheduler_opts)
+CONF.register_opts(keystone_opts, group="keystone_authtoken")
 
 class WorkerConsumer(threading.Thread):
     def __init__(self, threadID, name, queue, method, noComputeResourceCondition, resources):
@@ -313,7 +321,17 @@ class FairShareScheduler(driver.Scheduler):
      
         self.queue = PersistentPriorityRequestQueue(mysqlHost=CONF.mysql_host, mysqlUser=CONF.mysql_user, mysqlPasswd=CONF.mysql_passwd, mysqlDatabase=CONF.mysql_scheduler_db, poolSize=CONF.mysql_pool_size)
 
-        self.faireShareManager = FairShareManager(mysqlHost=CONF.mysql_host, mysqlUser=CONF.mysql_user, mysqlPasswd=CONF.mysql_passwd, numOfPeriods=CONF.num_of_periods, periodLength=CONF.period_length, defaultProjectShare=CONF.default_project_share, projectShares=projectShares, userShares=userShares, decayWeight=CONF.decay_weight, vcpusWeight=CONF.fair_share_vcpus_weight, memoryWeight=CONF.fair_share_memory_weight)
+        self.keystone_admin_user = CONF.keystone_authtoken.admin_user
+        self.keystone_admin_password = CONF.keystone_authtoken.admin_password
+        self.keystone_admin_project_name = CONF.keystone_authtoken.admin_tenant_name
+        self.keystone_auth_url = CONF.keystone_authtoken.auth_uri
+
+        self.faireShareManager = FairShareManager(mysqlHost=CONF.mysql_host, mysqlUser=CONF.mysql_user, mysqlPasswd=CONF.mysql_passwd,
+                                                  numOfPeriods=CONF.num_of_periods, periodLength=CONF.period_length, defaultProjectShare=CONF.default_project_share,
+                                                  projectShares=projectShares, userShares=userShares, decayWeight=CONF.decay_weight,
+                                                  vcpusWeight=CONF.fair_share_vcpus_weight, memoryWeight=CONF.fair_share_memory_weight,
+                                                  keystone_admin_user=self.keystone_admin_user, keystone_admin_password=self.keystone_admin_password,
+                                                  keystone_admin_project_name=self.keystone_admin_project_name, keystone_auth_url=self.keystone_auth_url)
         self.__priorityUpdater()
         
         #self.conn = rpc.create_connection(new=True)
