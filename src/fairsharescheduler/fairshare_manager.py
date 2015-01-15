@@ -317,11 +317,6 @@ class FairShareManager(object):
         cursor = conn.cursor()
         period = str(periodLength)
 
-        LOG.warn("mysqlUser: %s" % self.mysqlUser)
-        LOG.warn("mysqlPasswd: %s" % self.mysqlPasswd)
-        LOG.warn("mysqlHost: %s" % self.mysqlHost)
-
-
         try:            
             cursor.execute("select ni.user_id as user_id, ni.project_id as project, ((sum((UNIX_TIMESTAMP(IF(IFNULL(ni.terminated_at,'" + fromDate + "')>='" + fromDate + "','" + fromDate + "',  ni.terminated_at)) - (IF( (ni.launched_at>=DATE_SUB('" + fromDate + "', INTERVAL '" + period + "' day)),UNIX_TIMESTAMP(ni.launched_at),UNIX_TIMESTAMP(DATE_SUB('" + fromDate + "', INTERVAL '" + period + "' day)) ))))/60) *ni.memory_mb) as memory_usage,((sum((UNIX_TIMESTAMP(IF(IFNULL(ni.terminated_at,'" + fromDate + "')>='" + fromDate + "','" + fromDate + "',  ni.terminated_at)) - (IF( (ni.launched_at>=DATE_SUB('" + fromDate + "', INTERVAL '" + period + "' day)),UNIX_TIMESTAMP(ni.launched_at),UNIX_TIMESTAMP(DATE_SUB('" + fromDate + "', INTERVAL '" + period + "' day)) ))))/60) * ni.vcpus) as vcpu_usage from nova.instances ni where ni.launched_at IS NOT NULL and ni.launched_at <='" + fromDate + "' and(ni.terminated_at>=DATE_SUB('" + fromDate + "', INTERVAL '" + period + "' day) OR ni.terminated_at is null) group by ni.user_id, ni.project_id")
 
