@@ -37,19 +37,28 @@ class Status(object):
     def getResourceData(self):
         resources = {}
         dbConnection = None
+        resources = {"id" : 0,
+                     "vcpus_used": 0,
+                     "vcpus_available": 0,
+                     "running_vms": 0
+        }
+
 
         try:
             dbConnection = MySQLdb.connect(self.mysqlHost, self.mysqlUser, self.mysqlPasswd)
             cursor = dbConnection.cursor()
             cursor.execute("""select ncn.id, ncn.vcpus, ncn.vcpus_used, ncn.running_vms from nova.compute_nodes as ncn where ncn.deleted_at is NULL""")
-            item = cursor.fetchone()
-            resources = {"id" : item[0],
-                         "vcpus_used": item[2],
-                         "vcpus_available": ((item[1]*self.vcpuRatio)-item[2]), 
-                         "running_vms": item[3]}
+
+            for item in cursor.fetchall():
+                resources["id"] += item[0]
+                resources["vcpus_used"] += item[2]
+                resources["vcpus_available"] += ((item[1]*self.vcpuRatio)-item[2])
+                resources["running_vms"] += item[3]
 
             cursor.execute("""select count(*) from %s.priority_queue""" % self.mysqlDB)
+
             item = cursor.fetchone()
+
             resources["request_in_queue"] = item[0]
         except MySQLdb.Error, e:
             print "Error %d: %s" % (e.args[0],e.args[1])
